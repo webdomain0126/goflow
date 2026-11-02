@@ -1,0 +1,18 @@
+# Build output
+/bin/
+*.exe
+*.test
+
+# Test and profiling output
+*.out
+coverage.html
+*.prof
+
+# Local environment files (may contain secrets)
+.env
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

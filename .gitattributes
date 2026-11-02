@@ -1,0 +1,7 @@
+# Store all text files with LF line endings, even on Windows.
+# This keeps files identical across Windows, Linux and Docker containers.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
