@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Real PostgreSQL and Redis for the integration tests.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: goflow
+          POSTGRES_PASSWORD: goflow
+          POSTGRES_DB: goflow
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U goflow -d goflow"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: go vet
+        run: go vet -tags=integration ./...
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@2025.1.1 -tags=integration ./...
+
+      - name: Unit tests
+        run: go test -race ./...
+
+      - name: Integration tests
+        run: go test -race -tags=integration -p 1 -count=1 ./...
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t goflow:ci .

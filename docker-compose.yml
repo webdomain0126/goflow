@@ -1,7 +1,23 @@
-# Local development services for GoFlow.
-# Start:  docker compose up -d
-# Stop:   docker compose down        (keeps data)
-# Reset:  docker compose down -v     (deletes data)
+# GoFlow local stack.
+#
+# Only the databases (for running Go code on your machine):
+#   docker compose up -d --wait
+#
+# Everything, including the API and a worker, in containers
+# (the api and worker services are in the "app" profile):
+#   docker compose --profile app up -d --build --wait
+#
+# Several workers (they share the queue safely):
+#   docker compose --profile app up -d --build --wait --scale worker=3
+#
+# Stop:   docker compose --profile app down        (keeps data)
+# Reset:  docker compose --profile app down -v     (deletes data)
+
+x-goflow-env: &goflow-env
+  GOFLOW_DATABASE_URL: postgres://goflow:goflow@postgres:5432/goflow?sslmode=disable
+  GOFLOW_REDIS_URL: redis://redis:6379/0
+  GOFLOW_LOG_LEVEL: info
+  GOFLOW_SHUTDOWN_TIMEOUT: 25s
 
 services:
   postgres:
@@ -29,6 +45,35 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  api:
+    build: .
+    image: goflow:local
+    entrypoint: ["/usr/local/bin/goflow-api"]
+    environment:
+      <<: *goflow-env
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    profiles: ["app"]
+
+  worker:
+    image: goflow:local
+    entrypoint: ["/usr/local/bin/goflow-worker"]
+    environment:
+      <<: *goflow-env
+      GOFLOW_WORKER_CONCURRENCY: "10"
+      GOFLOW_RATE_LIMITS: send_email=20
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      api: { condition: service_started } # the api service builds the shared image
+    # Docker sends SIGTERM, waits this long, then SIGKILLs. It must be
+    # longer than GOFLOW_SHUTDOWN_TIMEOUT so running jobs can finish.
+    stop_grace_period: 30s
+    profiles: ["app"]
 
 volumes:
   postgres-data:

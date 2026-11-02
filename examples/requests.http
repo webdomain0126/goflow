@@ -1,0 +1,61 @@
+# Example requests. In VS Code, install the "REST Client" extension
+# (by Huachao Mao), open this file, and click "Send Request" above each one.
+
+@api = http://localhost:8080
+
+### Create a job
+POST {{api}}/v1/jobs
+Content-Type: application/json
+Idempotency-Key: welcome-email-1
+
+{
+  "type": "send_email",
+  "payload": { "to": "tisa@example.com", "subject": "Welcome" },
+  "priority": 5
+}
+
+### Get a job
+GET {{api}}/v1/jobs/1
+
+### Schedule a job for later
+POST {{api}}/v1/jobs
+Content-Type: application/json
+
+{
+  "type": "echo",
+  "payload": { "report": "daily" },
+  "run_at": "2030-01-01T09:00:00Z"
+}
+
+### A job that fails twice, then succeeds
+POST {{api}}/v1/jobs
+Content-Type: application/json
+
+{ "type": "flaky", "payload": { "fail_attempts": 2 }, "max_attempts": 5 }
+
+### List jobs (newest first). Use next_cursor from the response as ?before=
+GET {{api}}/v1/jobs?limit=10
+
+### Only dead jobs
+GET {{api}}/v1/jobs?status=dead
+
+### Cancel a pending job
+POST {{api}}/v1/jobs/2/cancel
+
+### Retry a dead or cancelled job
+POST {{api}}/v1/jobs/2/retry
+
+### Counts by status
+GET {{api}}/v1/stats
+
+### Live workers (needs Redis)
+GET {{api}}/v1/workers
+
+### Health and readiness
+GET {{api}}/healthz
+
+###
+GET {{api}}/readyz
+
+### Prometheus metrics (API). Worker metrics are on port 9091.
+GET {{api}}/metrics

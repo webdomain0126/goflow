@@ -1,0 +1,11 @@
+.git
+.github
+.vscode
+.idea
+bin
+docs
+examples
+*.out
+*.prof
+coverage.html
+.env

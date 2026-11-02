@@ -16,3 +16,6 @@ coverage.html
 .idea/
 .DS_Store
 Thumbs.db
+
+# Redis data file (written if redis-server runs in this folder)
+dump.rdb

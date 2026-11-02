@@ -75,6 +75,9 @@ func TestLoadInvalid(t *testing.T) {
 		{"timeout missing unit", map[string]string{"GOFLOW_SHUTDOWN_TIMEOUT": "30"}, "must be a duration"},
 		{"timeout negative", map[string]string{"GOFLOW_SHUTDOWN_TIMEOUT": "-5s"}, "must be positive"},
 		{"unknown log level", map[string]string{"GOFLOW_LOG_LEVEL": "loud"}, "GOFLOW_LOG_LEVEL"},
+		{"poll interval too small", map[string]string{"GOFLOW_POLL_INTERVAL": "1ms"}, "at least 10ms"},
+		{"rate limit missing number", map[string]string{"GOFLOW_RATE_LIMITS": "email"}, "GOFLOW_RATE_LIMITS"},
+		{"rate limit zero", map[string]string{"GOFLOW_RATE_LIMITS": "email=0"}, "GOFLOW_RATE_LIMITS"},
 	}
 
 	for _, tt := range tests {
@@ -117,5 +120,26 @@ func TestEmptyValueUsesDefault(t *testing.T) {
 	}
 	if cfg.HTTPAddr != ":8080" {
 		t.Errorf("HTTPAddr = %q, want default %q", cfg.HTTPAddr, ":8080")
+	}
+}
+
+func TestRateLimitsAndRedis(t *testing.T) {
+	cfg, err := load(fakeEnv(map[string]string{
+		"GOFLOW_RATE_LIMITS": " send_email=50, sms=10 ",
+		"GOFLOW_REDIS_URL":   "disabled",
+	}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RateLimits["send_email"] != 50 || cfg.RateLimits["sms"] != 10 || len(cfg.RateLimits) != 2 {
+		t.Errorf("RateLimits = %v", cfg.RateLimits)
+	}
+	if cfg.RedisEnabled() {
+		t.Error("RedisEnabled() = true for GOFLOW_REDIS_URL=disabled")
+	}
+
+	def, _ := load(fakeEnv(nil))
+	if !def.RedisEnabled() || len(def.RateLimits) != 0 {
+		t.Errorf("defaults: RedisEnabled %v, RateLimits %v", def.RedisEnabled(), def.RateLimits)
 	}
 }

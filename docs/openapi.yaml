@@ -1,0 +1,201 @@
+openapi: 3.0.3
+info:
+  title: GoFlow API
+  version: 1.0.0
+  description: Distributed job processing engine. See docs/api.md for examples.
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/jobs:
+    post:
+      summary: Create a job
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string, maxLength: 128 }
+          description: Same key returns the existing job instead of creating a new one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateJob' }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '200':
+          description: Existing job returned for a repeated idempotency key
+          headers:
+            Idempotent-Replayed: { schema: { type: string, enum: ['true'] } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/Error' }
+        '413': { $ref: '#/components/responses/Error' }
+    get:
+      summary: List jobs, newest first
+      parameters:
+        - { in: query, name: status, schema: { $ref: '#/components/schemas/Status' } }
+        - { in: query, name: type, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { in: query, name: before, schema: { type: integer, minimum: 1 }, description: Cursor from next_cursor }
+      responses:
+        '200':
+          description: A page of jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs: { type: array, items: { $ref: '#/components/schemas/Job' } }
+                  next_cursor: { type: string, nullable: true }
+        '400': { $ref: '#/components/responses/Error' }
+  /v1/jobs/{id}:
+    get:
+      summary: Get a job
+      parameters: [ { $ref: '#/components/parameters/JobID' } ]
+      responses:
+        '200':
+          description: The job
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '400': { $ref: '#/components/responses/Error' }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/jobs/{id}/cancel:
+    post:
+      summary: Cancel a pending job
+      parameters: [ { $ref: '#/components/parameters/JobID' } ]
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/jobs/{id}/retry:
+    post:
+      summary: Re-queue a dead or cancelled job
+      parameters: [ { $ref: '#/components/parameters/JobID' } ]
+      responses:
+        '200':
+          description: Re-queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+        '404': { $ref: '#/components/responses/Error' }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/stats:
+    get:
+      summary: Job counts by status
+      responses:
+        '200':
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  counts: { type: object, additionalProperties: { type: integer } }
+                  total: { type: integer }
+  /v1/workers:
+    get:
+      summary: Workers with a live heartbeat (needs Redis)
+      responses:
+        '200':
+          description: Live workers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  workers: { type: array, items: { $ref: '#/components/schemas/Worker' } }
+        '503': { $ref: '#/components/responses/Error' }
+  /healthz:
+    get:
+      summary: Liveness probe
+      responses:
+        '200': { description: Process is running }
+  /readyz:
+    get:
+      summary: Readiness probe (checks the database)
+      responses:
+        '200': { description: Ready }
+        '503': { description: Database unreachable }
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Text exposition format
+          content:
+            text/plain: { schema: { type: string } }
+components:
+  parameters:
+    JobID:
+      in: path
+      name: id
+      required: true
+      schema: { type: integer, minimum: 1 }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Status:
+      type: string
+      enum: [pending, running, succeeded, cancelled, dead]
+    CreateJob:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type: { type: string, pattern: '^[a-z][a-z0-9_.-]{0,63}$', example: send_email }
+        payload: { description: Any JSON value, up to 256 KiB, example: { to: a@example.com } }
+        priority: { type: integer, minimum: 0, maximum: 100, default: 0 }
+        max_attempts: { type: integer, minimum: 1, maximum: 25, default: 3 }
+        run_at: { type: string, format: date-time }
+        idempotency_key: { type: string, maxLength: 128 }
+    Job:
+      type: object
+      properties:
+        id: { type: integer }
+        type: { type: string }
+        payload: {}
+        priority: { type: integer }
+        status: { $ref: '#/components/schemas/Status' }
+        attempts: { type: integer }
+        max_attempts: { type: integer }
+        run_at: { type: string, format: date-time }
+        locked_by: { type: string, nullable: true }
+        locked_until: { type: string, format: date-time, nullable: true }
+        last_error: { type: string, nullable: true }
+        idempotency_key: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time, nullable: true }
+    Worker:
+      type: object
+      properties:
+        id: { type: string }
+        types: { type: array, items: { type: string } }
+        concurrency: { type: integer }
+        active: { type: integer }
+        started_at: { type: string, format: date-time }
+        last_seen: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            field: { type: string }
