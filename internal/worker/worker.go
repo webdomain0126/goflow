@@ -122,6 +122,9 @@ type Worker struct {
 	observer Observer
 	wake     <-chan struct{}
 
+	// storeTimeout limits each call that records a job's result.
+	storeTimeout time.Duration
+
 	mu     sync.Mutex
 	active map[int64]context.CancelCauseFunc // running jobs and how to cancel each
 	busy   atomic.Int64                      // claimed jobs not yet finished
@@ -147,11 +150,12 @@ func New(store Store, cfg Config, log *slog.Logger, opts ...Option) *Worker {
 		log = slog.New(slog.DiscardHandler)
 	}
 	w := &Worker{
-		cfg:      cfg,
-		store:    store,
-		log:      log.With("worker_id", cfg.ID),
-		handlers: map[string]HandlerFunc{},
-		active:   map[int64]context.CancelCauseFunc{},
+		cfg:          cfg,
+		store:        store,
+		log:          log.With("worker_id", cfg.ID),
+		handlers:     map[string]HandlerFunc{},
+		active:       map[int64]context.CancelCauseFunc{},
+		storeTimeout: 10 * time.Second,
 	}
 	for _, o := range opts {
 		o(w)
@@ -333,11 +337,6 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 	defer cancelTimeout()
 	w.track(j.ID, cancel)
 
-	// Recording the result uses its own context: even during shutdown
-	// we still want to write "succeeded" for a job that just finished.
-	storeCtx, cancelStore := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancelStore()
-
 	if w.limiter != nil {
 		ok, retryAfter, err := w.limiter.Allow(jobCtx, j.Type)
 		if err != nil {
@@ -345,7 +344,7 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 			// Redis outage should not stop all work.
 			log.Warn("rate limiter unavailable, running job anyway", "err", err)
 		} else if !ok {
-			w.record(log, j, OutcomeReleased, start, w.store.Release(storeCtx, j.ID, w.cfg.ID, retryAfter))
+			w.record(log, j, OutcomeReleased, start, w.save(func(ctx context.Context) error { return w.store.Release(ctx, j.ID, w.cfg.ID, retryAfter) }))
 			return
 		}
 	}
@@ -354,7 +353,7 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 
 	switch {
 	case err == nil:
-		w.record(log, j, OutcomeSucceeded, start, w.store.Complete(storeCtx, j.ID, w.cfg.ID))
+		w.record(log, j, OutcomeSucceeded, start, w.save(func(ctx context.Context) error { return w.store.Complete(ctx, j.ID, w.cfg.ID) }))
 
 	case errors.Is(context.Cause(jobCtx), errLeaseLost):
 		// The reaper gave this job to someone else; our result does not count.
@@ -362,17 +361,31 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 
 	case errors.Is(context.Cause(jobCtx), errShutdown):
 		// Not the job's fault: give it back without counting the attempt.
-		w.record(log, j, OutcomeReleased, start, w.store.Release(storeCtx, j.ID, w.cfg.ID, 0))
+		w.record(log, j, OutcomeReleased, start, w.save(func(ctx context.Context) error { return w.store.Release(ctx, j.ID, w.cfg.ID, 0) }))
 
 	case job.IsPermanent(err) || !j.AttemptsLeft():
 		log.Warn("job failed permanently", "err", err)
-		w.record(log, j, OutcomeDead, start, w.store.MarkDead(storeCtx, j.ID, w.cfg.ID, truncate(err.Error())))
+		w.record(log, j, OutcomeDead, start, w.save(func(ctx context.Context) error { return w.store.MarkDead(ctx, j.ID, w.cfg.ID, truncate(err.Error())) }))
 
 	default:
 		delay := w.cfg.Backoff.Delay(j.Attempts)
 		log.Info("job failed, will retry", "err", err, "retry_in", delay.String())
-		w.record(log, j, OutcomeRetried, start, w.store.ScheduleRetry(storeCtx, j.ID, w.cfg.ID, truncate(err.Error()), delay))
+		w.record(log, j, OutcomeRetried, start, w.save(func(ctx context.Context) error {
+			return w.store.ScheduleRetry(ctx, j.ID, w.cfg.ID, truncate(err.Error()), delay)
+		}))
 	}
+}
+
+// save records a job's result with its own short timeout.
+//
+// The timeout starts here, when the result is written, and not when the
+// job started: a job may legitimately run for minutes. The context is also
+// independent of the worker's shutdown, so a job that just finished is
+// still recorded as succeeded while the worker is stopping.
+func (w *Worker) save(write func(ctx context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), w.storeTimeout)
+	defer cancel()
+	return write(ctx)
 }
 
 // runHandler calls the handler and turns a panic into an ordinary error,

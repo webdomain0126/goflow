@@ -120,21 +120,35 @@ func (s *memStore) finish(id int64, workerID string, update func(j *job.Job)) er
 	return nil
 }
 
-func (s *memStore) Complete(_ context.Context, id int64, w string) error {
+// Like a real database call, the finishing methods fail if ctx is
+// already cancelled or past its deadline.
+func (s *memStore) Complete(ctx context.Context, id int64, w string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.finish(id, w, func(j *job.Job) { j.Status = job.StatusSucceeded })
 }
 
-func (s *memStore) ScheduleRetry(_ context.Context, id int64, w, msg string, d time.Duration) error {
+func (s *memStore) ScheduleRetry(ctx context.Context, id int64, w, msg string, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.finish(id, w, func(j *job.Job) {
 		j.Status, j.RunAt, j.LastError = job.StatusPending, time.Now().Add(d), &msg
 	})
 }
 
-func (s *memStore) MarkDead(_ context.Context, id int64, w, msg string) error {
+func (s *memStore) MarkDead(ctx context.Context, id int64, w, msg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.finish(id, w, func(j *job.Job) { j.Status, j.LastError = job.StatusDead, &msg })
 }
 
-func (s *memStore) Release(_ context.Context, id int64, w string, d time.Duration) error {
+func (s *memStore) Release(ctx context.Context, id int64, w string, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.finish(id, w, func(j *job.Job) {
 		j.Status, j.RunAt, j.Attempts = job.StatusPending, time.Now().Add(d), j.Attempts-1
 	})

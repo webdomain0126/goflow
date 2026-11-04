@@ -350,3 +350,21 @@ func TestOnlyClaimsRegisteredTypes(t *testing.T) {
 		t.Errorf("job with no local handler: status %s, want it left pending for another worker", st)
 	}
 }
+
+// Regression test for a real bug found while running GoFlow in Docker:
+// the timeout for saving a job's result started *before* the job ran,
+// so any job slower than that timeout could never record its result.
+// It then stayed "running" until its lease expired and was run again.
+func TestSlowJobCanStillRecordResult(t *testing.T) {
+	s := newMemStore()
+	id := s.add("slow", 1, "")
+	w := New(s, fastConfig(), nil)
+	w.storeTimeout = 50 * time.Millisecond // the job below takes longer than this
+	w.Handle("slow", func(context.Context, job.Job) error {
+		time.Sleep(150 * time.Millisecond)
+		return nil
+	})
+	startWorker(t, w)
+
+	waitFor(t, "slow job recorded as succeeded", func() bool { return s.get(id).Status == job.StatusSucceeded })
+}
