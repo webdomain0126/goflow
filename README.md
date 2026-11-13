@@ -1,4 +1,8 @@
-# GoFlow
+# GoFlow 
+
+[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/webdomain0126/badge.svg)](https://hub.xerj.org/contributors/webdomain0126)
+
+GoFlow is listed in the [XERJ Corpus Hub](https://hub.xerj.org/corpus/webdomain0126--goflow) as a reference implementation for AI coding agents.
 
 **A distributed job processing engine in Go, backed by PostgreSQL and Redis.**
 
