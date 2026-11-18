@@ -268,17 +268,17 @@ func TestCompleteRequiresLease(t *testing.T) {
 	claimed, _ := s.Claim(ctx, job.ClaimRequest{WorkerID: "w1", Limit: 1, Lease: time.Minute})
 	id := claimed[0].ID
 
-	if err := s.Complete(ctx, id, "w2"); !errors.Is(err, job.ErrLeaseLost) {
+	if err := s.Complete(ctx, id, "w2", 1); !errors.Is(err, job.ErrLeaseLost) {
 		t.Errorf("complete by non-owner: err = %v, want ErrLeaseLost", err)
 	}
-	if err := s.Complete(ctx, id, "w1"); err != nil {
+	if err := s.Complete(ctx, id, "w1", 1); err != nil {
 		t.Fatalf("complete by owner: %v", err)
 	}
 	j, _ := s.Get(ctx, id)
 	if j.Status != job.StatusSucceeded || j.FinishedAt == nil || j.LockedBy != nil {
 		t.Errorf("after complete: %+v", j)
 	}
-	if err := s.Complete(ctx, id, "w1"); !errors.Is(err, job.ErrLeaseLost) {
+	if err := s.Complete(ctx, id, "w1", 1); !errors.Is(err, job.ErrLeaseLost) {
 		t.Errorf("completing twice: err = %v, want ErrLeaseLost", err)
 	}
 }
@@ -290,7 +290,7 @@ func TestScheduleRetryAndMarkDead(t *testing.T) {
 
 	claimed, _ := s.Claim(ctx, job.ClaimRequest{WorkerID: "w1", Limit: 1, Lease: time.Minute})
 	id := claimed[0].ID
-	if err := s.ScheduleRetry(ctx, id, "w1", "boom", time.Hour); err != nil {
+	if err := s.ScheduleRetry(ctx, id, "w1", 1, "boom", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	j, _ := s.Get(ctx, id)
@@ -310,7 +310,7 @@ func TestScheduleRetryAndMarkDead(t *testing.T) {
 	if len(claimed) != 1 || claimed[0].Attempts != 2 {
 		t.Fatalf("second claim: %+v", claimed)
 	}
-	if err := s.MarkDead(ctx, id, "w1", "boom again"); err != nil {
+	if err := s.MarkDead(ctx, id, "w1", 2, "boom again"); err != nil {
 		t.Fatal(err)
 	}
 	j, _ = s.Get(ctx, id)
@@ -325,7 +325,7 @@ func TestReleaseDoesNotCountAttempt(t *testing.T) {
 	mustCreate(t, s, job.CreateParams{Type: "a"})
 	claimed, _ := s.Claim(ctx, job.ClaimRequest{WorkerID: "w1", Limit: 1, Lease: time.Minute})
 
-	if err := s.Release(ctx, claimed[0].ID, "w1", 0); err != nil {
+	if err := s.Release(ctx, claimed[0].ID, "w1", 1, 0); err != nil {
 		t.Fatal(err)
 	}
 	j, _ := s.Get(ctx, claimed[0].ID)
@@ -388,7 +388,7 @@ func TestReapExpired(t *testing.T) {
 		t.Errorf("job with valid lease: status %s, want running", j.Status)
 	}
 	// The crashed worker must not be able to complete a reaped job.
-	if err := s.Complete(ctx, retryable.ID, "crashed-worker"); !errors.Is(err, job.ErrLeaseLost) {
+	if err := s.Complete(ctx, retryable.ID, "crashed-worker", 1); !errors.Is(err, job.ErrLeaseLost) {
 		t.Errorf("late complete after reap: err = %v, want ErrLeaseLost", err)
 	}
 }
@@ -471,4 +471,40 @@ func ids(jobs []job.Job) []int64 {
 		out[i] = j.ID
 	}
 	return out
+}
+
+// TestLateAckFromOldAttemptIsRejected covers the case where a worker
+// stalls past its lease, the job is re-queued, and the SAME worker claims
+// it again. The stale first attempt must not be able to finish the job:
+// the attempt number acts as a fencing token. (Suggested in a review.)
+func TestLateAckFromOldAttemptIsRejected(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	mustCreate(t, s, job.CreateParams{Type: "a", MaxAttempts: 3})
+
+	first, _ := s.Claim(ctx, job.ClaimRequest{WorkerID: "w1", Limit: 1, Lease: time.Minute})
+	id := first[0].ID // attempt 1
+
+	// Attempt 1 stalls past its lease; the reaper re-queues the job...
+	s.pool.Exec(ctx, "UPDATE jobs SET locked_until = now() - interval '1 second' WHERE id = $1", id)
+	if n, _ := s.ReapExpired(ctx, 10); n != 1 {
+		t.Fatalf("reaped %d jobs, want 1", n)
+	}
+	// ...and the same worker claims it again as attempt 2.
+	second, _ := s.Claim(ctx, job.ClaimRequest{WorkerID: "w1", Limit: 1, Lease: time.Minute})
+	if len(second) != 1 || second[0].Attempts != 2 {
+		t.Fatalf("second claim = %+v, want attempt 2", second)
+	}
+
+	// The stale attempt 1 finishes late. It must be rejected.
+	if err := s.Complete(ctx, id, "w1", 1); !errors.Is(err, job.ErrLeaseLost) {
+		t.Fatalf("late ack from attempt 1: err = %v, want ErrLeaseLost", err)
+	}
+	if j, _ := s.Get(ctx, id); j.Status != job.StatusRunning {
+		t.Fatalf("stale ack changed the job: status = %s, want running", j.Status)
+	}
+	// The current attempt 2 can still finish normally.
+	if err := s.Complete(ctx, id, "w1", 2); err != nil {
+		t.Fatalf("ack from current attempt 2: %v", err)
+	}
 }

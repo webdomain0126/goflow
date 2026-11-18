@@ -40,7 +40,7 @@ func BenchmarkClaimComplete(b *testing.B) {
 					b.Fatal(err)
 				}
 				for _, j := range jobs {
-					if err := s.Complete(ctx, j.ID, "bench"); err != nil {
+					if err := s.Complete(ctx, j.ID, "bench", j.Attempts); err != nil {
 						b.Fatal(err)
 					}
 				}

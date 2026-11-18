@@ -245,41 +245,46 @@ func (s *Store) ExtendLeases(ctx context.Context, workerID string, ids []int64, 
 
 // Complete marks a running job as succeeded. It returns job.ErrLeaseLost
 // if workerID no longer owns the job.
-func (s *Store) Complete(ctx context.Context, id int64, workerID string) error {
+func (s *Store) Complete(ctx context.Context, id int64, workerID string, attempt int) error {
 	return s.finish(ctx, `
 		UPDATE jobs SET status = 'succeeded', finished_at = now(), updated_at = now(),
 			locked_by = NULL, locked_until = NULL, last_error = NULL
-		WHERE id = $1 AND locked_by = $2 AND status = 'running'`, id, workerID)
+		WHERE id = $1 AND locked_by = $2 AND attempts = $3 AND status = 'running'`, id, workerID, attempt)
 }
 
 // ScheduleRetry puts a failed job back to pending, to run again after delay.
-func (s *Store) ScheduleRetry(ctx context.Context, id int64, workerID, errMsg string, delay time.Duration) error {
+func (s *Store) ScheduleRetry(ctx context.Context, id int64, workerID string, attempt int, errMsg string, delay time.Duration) error {
 	return s.finish(ctx, `
 		UPDATE jobs SET status = 'pending', run_at = now() + $4::interval, updated_at = now(),
 			locked_by = NULL, locked_until = NULL, last_error = $3
-		WHERE id = $1 AND locked_by = $2 AND status = 'running'`, id, workerID, errMsg, delay)
+		WHERE id = $1 AND locked_by = $2 AND attempts = $5 AND status = 'running'`, id, workerID, errMsg, delay, attempt)
 }
 
 // MarkDead records a job that failed and will not be retried automatically.
-func (s *Store) MarkDead(ctx context.Context, id int64, workerID, errMsg string) error {
+func (s *Store) MarkDead(ctx context.Context, id int64, workerID string, attempt int, errMsg string) error {
 	return s.finish(ctx, `
 		UPDATE jobs SET status = 'dead', finished_at = now(), updated_at = now(),
 			locked_by = NULL, locked_until = NULL, last_error = $3
-		WHERE id = $1 AND locked_by = $2 AND status = 'running'`, id, workerID, errMsg)
+		WHERE id = $1 AND locked_by = $2 AND attempts = $4 AND status = 'running'`, id, workerID, errMsg, attempt)
 }
 
 // Release hands a claimed job back without counting the attempt, for
 // example when a rate limit says "not yet". It runs again after delay.
-func (s *Store) Release(ctx context.Context, id int64, workerID string, delay time.Duration) error {
+func (s *Store) Release(ctx context.Context, id int64, workerID string, attempt int, delay time.Duration) error {
 	return s.finish(ctx, `
 		UPDATE jobs SET status = 'pending', run_at = now() + $3::interval, updated_at = now(),
 			locked_by = NULL, locked_until = NULL, attempts = GREATEST(attempts - 1, 0)
-		WHERE id = $1 AND locked_by = $2 AND status = 'running'`, id, workerID, delay)
+		WHERE id = $1 AND locked_by = $2 AND attempts = $4 AND status = 'running'`, id, workerID, delay, attempt)
 }
 
-// finish runs a lease-guarded UPDATE. The "locked_by = worker AND
-// status = 'running'" condition means a worker whose lease was taken
-// away cannot overwrite the result of whoever owns the job now.
+// finish runs a lease-guarded UPDATE. The condition
+// "locked_by = worker AND attempts = attempt AND status = 'running'"
+// means only the current attempt can record a result.
+//
+// The attempt number works as a fencing token: every claim increases it,
+// so an attempt that stalled past its lease (and whose job was claimed
+// again, even by the same worker) can no longer overwrite the newer
+// attempt's state. Checking locked_by alone would miss that case.
 func (s *Store) finish(ctx context.Context, sql string, args ...any) error {
 	tag, err := s.pool.Exec(ctx, sql, args...)
 	if err != nil {

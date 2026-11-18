@@ -39,10 +39,10 @@ type HandlerFunc func(ctx context.Context, j job.Job) error
 type Store interface {
 	Claim(ctx context.Context, req job.ClaimRequest) ([]job.Job, error)
 	ExtendLeases(ctx context.Context, workerID string, ids []int64, lease time.Duration) ([]int64, error)
-	Complete(ctx context.Context, id int64, workerID string) error
-	ScheduleRetry(ctx context.Context, id int64, workerID, errMsg string, delay time.Duration) error
-	MarkDead(ctx context.Context, id int64, workerID, errMsg string) error
-	Release(ctx context.Context, id int64, workerID string, delay time.Duration) error
+	Complete(ctx context.Context, id int64, workerID string, attempt int) error
+	ScheduleRetry(ctx context.Context, id int64, workerID string, attempt int, errMsg string, delay time.Duration) error
+	MarkDead(ctx context.Context, id int64, workerID string, attempt int, errMsg string) error
+	Release(ctx context.Context, id int64, workerID string, attempt int, delay time.Duration) error
 	ReapExpired(ctx context.Context, limit int) (int64, error)
 }
 
@@ -126,8 +126,8 @@ type Worker struct {
 	storeTimeout time.Duration
 
 	mu     sync.Mutex
-	active map[int64]context.CancelCauseFunc // running jobs and how to cancel each
-	busy   atomic.Int64                      // claimed jobs not yet finished
+	active map[runKey]context.CancelCauseFunc // running attempts and how to cancel each
+	busy   atomic.Int64                       // claimed jobs not yet finished
 }
 
 // Option configures optional parts of a Worker.
@@ -154,7 +154,7 @@ func New(store Store, cfg Config, log *slog.Logger, opts ...Option) *Worker {
 		store:        store,
 		log:          log.With("worker_id", cfg.ID),
 		handlers:     map[string]HandlerFunc{},
-		active:       map[int64]context.CancelCauseFunc{},
+		active:       map[runKey]context.CancelCauseFunc{},
 		storeTimeout: 10 * time.Second,
 	}
 	for _, o := range opts {
@@ -274,8 +274,8 @@ func (w *Worker) fetchLoop(ctx context.Context, jobs chan<- job.Job, slotFreed <
 			}
 			for _, j := range claimed {
 				w.busy.Add(1)
-				w.track(j.ID, nil) // lease is ours from now on; heartbeat must renew it
-				jobs <- j          // an executor is free because we only claimed `free` jobs
+				w.track(j, nil) // lease is ours from now on; heartbeat must renew it
+				jobs <- j       // an executor is free because we only claimed `free` jobs
 			}
 			full = len(claimed) == free
 		}
@@ -302,16 +302,24 @@ func (w *Worker) fetchLoop(ctx context.Context, jobs chan<- job.Job, slotFreed <
 	}
 }
 
-// track records a running job; cancel may be nil until the job starts.
-func (w *Worker) track(id int64, cancel context.CancelCauseFunc) {
+// runKey identifies one attempt of a job. Keying by attempt (not only by
+// job ID) keeps two attempts of the same job apart if this worker ever
+// claims a job again while a stalled earlier attempt is still finishing.
+type runKey struct {
+	id      int64
+	attempt int
+}
+
+// track records a running attempt; cancel may be nil until the job starts.
+func (w *Worker) track(j job.Job, cancel context.CancelCauseFunc) {
 	w.mu.Lock()
-	w.active[id] = cancel
+	w.active[runKey{j.ID, j.Attempts}] = cancel
 	w.mu.Unlock()
 }
 
-func (w *Worker) untrack(id int64) {
+func (w *Worker) untrack(j job.Job) {
 	w.mu.Lock()
-	delete(w.active, id)
+	delete(w.active, runKey{j.ID, j.Attempts})
 	w.mu.Unlock()
 	w.busy.Add(-1)
 	w.reportActive()
@@ -325,7 +333,7 @@ func (w *Worker) reportActive() {
 
 // execute runs one job and records the result. It never panics.
 func (w *Worker) execute(runCtx context.Context, j job.Job) {
-	defer w.untrack(j.ID)
+	defer w.untrack(j)
 	log := w.log.With("job_id", j.ID, "type", j.Type, "attempt", j.Attempts)
 	start := time.Now()
 
@@ -335,7 +343,7 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 	defer cancel(nil)
 	jobCtx, cancelTimeout := context.WithTimeout(jobCtx, w.cfg.JobTimeout)
 	defer cancelTimeout()
-	w.track(j.ID, cancel)
+	w.track(j, cancel)
 
 	if w.limiter != nil {
 		ok, retryAfter, err := w.limiter.Allow(jobCtx, j.Type)
@@ -344,7 +352,7 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 			// Redis outage should not stop all work.
 			log.Warn("rate limiter unavailable, running job anyway", "err", err)
 		} else if !ok {
-			w.record(log, j, OutcomeReleased, start, w.save(func(ctx context.Context) error { return w.store.Release(ctx, j.ID, w.cfg.ID, retryAfter) }))
+			w.record(log, j, OutcomeReleased, start, w.save(func(ctx context.Context) error { return w.store.Release(ctx, j.ID, w.cfg.ID, j.Attempts, retryAfter) }))
 			return
 		}
 	}
@@ -353,7 +361,7 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 
 	switch {
 	case err == nil:
-		w.record(log, j, OutcomeSucceeded, start, w.save(func(ctx context.Context) error { return w.store.Complete(ctx, j.ID, w.cfg.ID) }))
+		w.record(log, j, OutcomeSucceeded, start, w.save(func(ctx context.Context) error { return w.store.Complete(ctx, j.ID, w.cfg.ID, j.Attempts) }))
 
 	case errors.Is(context.Cause(jobCtx), errLeaseLost):
 		// The reaper gave this job to someone else; our result does not count.
@@ -361,17 +369,19 @@ func (w *Worker) execute(runCtx context.Context, j job.Job) {
 
 	case errors.Is(context.Cause(jobCtx), errShutdown):
 		// Not the job's fault: give it back without counting the attempt.
-		w.record(log, j, OutcomeReleased, start, w.save(func(ctx context.Context) error { return w.store.Release(ctx, j.ID, w.cfg.ID, 0) }))
+		w.record(log, j, OutcomeReleased, start, w.save(func(ctx context.Context) error { return w.store.Release(ctx, j.ID, w.cfg.ID, j.Attempts, 0) }))
 
 	case job.IsPermanent(err) || !j.AttemptsLeft():
 		log.Warn("job failed permanently", "err", err)
-		w.record(log, j, OutcomeDead, start, w.save(func(ctx context.Context) error { return w.store.MarkDead(ctx, j.ID, w.cfg.ID, truncate(err.Error())) }))
+		w.record(log, j, OutcomeDead, start, w.save(func(ctx context.Context) error {
+			return w.store.MarkDead(ctx, j.ID, w.cfg.ID, j.Attempts, truncate(err.Error()))
+		}))
 
 	default:
 		delay := w.cfg.Backoff.Delay(j.Attempts)
 		log.Info("job failed, will retry", "err", err, "retry_in", delay.String())
 		w.record(log, j, OutcomeRetried, start, w.save(func(ctx context.Context) error {
-			return w.store.ScheduleRetry(ctx, j.ID, w.cfg.ID, truncate(err.Error()), delay)
+			return w.store.ScheduleRetry(ctx, j.ID, w.cfg.ID, j.Attempts, truncate(err.Error()), delay)
 		}))
 	}
 }
@@ -435,8 +445,12 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 		}
 		w.mu.Lock()
 		ids := make([]int64, 0, len(w.active))
-		for id := range w.active {
-			ids = append(ids, id)
+		seen := make(map[int64]bool, len(w.active))
+		for k := range w.active {
+			if !seen[k.id] {
+				seen[k.id] = true
+				ids = append(ids, k.id)
+			}
 		}
 		w.mu.Unlock()
 		if len(ids) == 0 {
@@ -455,9 +469,9 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			kept[id] = true
 		}
 		w.mu.Lock()
-		for _, id := range ids {
-			if cancel, ok := w.active[id]; ok && !kept[id] && cancel != nil {
-				w.log.Warn("lease lost, cancelling job", "job_id", id)
+		for k, cancel := range w.active {
+			if !kept[k.id] && cancel != nil {
+				w.log.Warn("lease lost, cancelling job", "job_id", k.id, "attempt", k.attempt)
 				cancel(errLeaseLost)
 			}
 		}

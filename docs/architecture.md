@@ -90,9 +90,12 @@ A claimed job gets a **lease**: `locked_by = worker id`, `locked_until = now() +
   network. Jobs with attempts left go back to `pending`; the others become `dead`.
   `SKIP LOCKED` makes it safe for every worker to run the reaper.
 - **Fencing**: completing, retrying, or failing a job uses
-  `WHERE id = $1 AND locked_by = $me AND status = 'running'`. A slow worker
-  whose lease was taken away cannot overwrite the new owner's result; it
-  gets `ErrLeaseLost`.
+  `WHERE id = $1 AND locked_by = $me AND attempts = $myAttempt AND status = 'running'`.
+  The attempt number is a **fencing token**: every claim increases it, so
+  only the current attempt can record a result. A slow attempt whose lease
+  was taken away gets `ErrLeaseLost`, even if the *same* worker has since
+  claimed the job again (`TestLateAckFromOldAttemptIsRejected`). Checking
+  `locked_by` alone would miss that case, which a reviewer pointed out.
 
 ### Delivery guarantee: at-least-once
 
